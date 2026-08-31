@@ -1,0 +1,66 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Agent Monitor",
+  "version": "0.1.0",
+  "identifier": "com.agentmonitor.desktop",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Agent Monitor",
+        "width": 1180,
+        "height": 780,
+        "minWidth": 860,
+        "minHeight": 580,
+        "resizable": true,
+        "fullscreen": false,
+        "visible": false,
+        "decorations": true
+      },
+      {
+        "label": "quick",
+        "title": "Agent Monitor · 任务雷达",
+        "width": 404,
+        "height": 600,
+        "minWidth": 340,
+        "minHeight": 470,
+        "maxWidth": 620,
+        "maxHeight": 840,
+        "resizable": true,
+        "maximizable": false,
+        "fullscreen": false,
+        "visible": true,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": false,
+        "visibleOnAllWorkspaces": true,
+        "skipTaskbar": true,
+        "shadow": true,
+        "acceptFirstMouse": true,
+        "preventOverflow": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost 'self' http://localhost:1420 ws://localhost:1420;"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/64x64.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}
