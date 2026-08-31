@@ -11,6 +11,7 @@ pnpm typecheck
 pnpm build
 cd src-tauri && cargo fmt --all -- --check
 cd src-tauri && cargo test --all-targets
+cd src-tauri && cargo clippy --all-targets -- -D warnings
 ```
 
 Please keep provider-specific parsing in the adapter/core layer, avoid storing

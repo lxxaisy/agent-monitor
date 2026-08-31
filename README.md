@@ -1,12 +1,49 @@
 # Agent Monitor
 
-> A local, read-only macOS menu-bar companion for monitoring Codex tasks in real time.
+[![CI](https://github.com/lxxaisy/agent-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/lxxaisy/agent-monitor/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/lxxaisy/agent-monitor)](https://github.com/lxxaisy/agent-monitor/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-2f855a.svg)](LICENSE)
+[![macOS](https://img.shields.io/badge/macOS-13%2B-111820?logo=apple)](https://github.com/lxxaisy/agent-monitor/releases/latest)
 
-Agent Monitor 是一个本地、只读的 macOS 菜单栏任务监控器。启动后默认显示一个
-右上角常驻的“任务雷达”浮窗，完整控制台保持隐藏；浮窗跨桌面可见，但不会强制
-覆盖其他应用。关闭浮窗只会隐藏它，不会停止后台监控。首版连接本机 `codex app-server` 的 stdio
-JSON-RPC 通道，按 Codex 返回的 `cwd` 精确分组，展示线程最近一个 turn 的运行、
-待处理、空闲、完成、失败和中断状态。
+> A local, read-only macOS companion for monitoring Codex tasks in real time.
+
+Agent Monitor keeps a draggable task radar within sight while Codex works. It surfaces only
+live turns, attention requests, and recent completions; the full dashboard stays out of the way
+until it is needed. The first release is local-only, read-only, and focused on Codex.
+
+Agent Monitor 是一个本地、只读的 macOS 任务监控器。它默认以可拖动、可缩放的
+“任务雷达”浮窗常驻，完整控制台保持隐藏；浮窗跨桌面可见，但不会强制覆盖其他
+应用。它关注正在执行、等待处理和刚刚完成的 Codex turn，让历史失败或空闲线程
+不再污染当前视图。
+
+## 界面预览
+
+截图使用虚构任务和目录，不包含本机 Codex 数据。
+
+<p align="center">
+  <img src="docs/screenshots/quick-panel.jpg" width="404" alt="Agent Monitor 可拖动的任务雷达浮窗" />
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/dashboard.jpg" width="100%" alt="Agent Monitor 实时任务控制台" />
+</p>
+
+## 安装
+
+当前预构建版本支持 macOS 13+ 和 Apple Silicon，并要求本机已安装且登录 Codex App
+或 Codex CLI。
+
+1. 从 [Latest Release](https://github.com/lxxaisy/agent-monitor/releases/latest) 下载
+   `Agent.Monitor_*_aarch64.dmg`。
+2. 打开 DMG，将 **Agent Monitor** 拖入 **Applications**。
+3. 从“应用程序”启动。任务雷达会直接出现，完整控制台默认不打开。
+
+当前 DMG 使用 ad-hoc 签名，尚未经过 Apple 公证。如果 macOS 阻止首次启动，请先在
+Finder 中按住 Control 点击应用并选择“打开”；若仍被阻止，再前往“系统设置 → 隐私与
+安全性”，确认应用名称后选择“仍要打开”。不要从非本仓库 Release 页面下载构建产物。
+
+应用会优先使用 ChatGPT App 内置的原生 Codex 可执行文件，也可以在“设置与诊断”中
+手动指定 `codex` 路径和 `CODEX_HOME`。
 
 ## 当前范围
 
@@ -21,6 +58,15 @@ JSON-RPC 通道，按 Codex 返回的 `cwd` 精确分组，展示线程最近一
 - macOS 原生通知支持点击后打开任务雷达并定位到对应任务详情；通知权限被拒绝时仍保留浮窗、托盘徽标和应用内提醒。
 - 运行中的任务显示缓慢的进度流光，待处理和最近完成使用低频状态呼吸与语义色提示；开启系统“减少动态效果”后自动关闭持续动画。
 - 在 macOS 上点击“在 Codex 中打开”会通过 `codex://threads/<taskId>` deeplink 定位到 Codex App；非 macOS 环境使用受控的 `codex resume <taskId>` 参数调用。
+
+## 状态准确性
+
+- `running` 只表示最近 turn 正在执行。
+- `needs_action` 只表示正在等待批准或用户输入。
+- `succeeded`、`failed` 和 `interrupted` 是最近 turn 的明确终态。
+- `idle` 只表示线程当前没有运行中的 turn，不代表项目完成。
+- 初次同步只建立基线，不会为历史终态发送通知。
+- 没有计划步骤时不显示虚构百分比，而是明确标记“不可估算”。
 
 ## 开发
 
@@ -55,6 +101,13 @@ pnpm tauri build
 
 默认数据库位置为：
 `~/Library/Application Support/Agent Monitor/monitor.db`
+
+## 卸载
+
+先从菜单栏图标中退出 Agent Monitor，再将
+`/Applications/Agent Monitor.app` 移到废纸篓。若也要清除监控器自己的轻量快照，
+可在卸载前使用“设置与诊断 → 清除本地快照”，或在 Finder 的“前往文件夹”中删除
+`~/Library/Application Support/Agent Monitor/`。这不会删除或修改任何 Codex 任务。
 
 ## 开源协议
 
