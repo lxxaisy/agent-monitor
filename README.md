@@ -14,13 +14,13 @@ Agent Monitor keeps active work visible without collecting prompts, answers or c
 - Shows running, needs-action, completed, failed and interrupted work with parent/child relationships.
 - Provides a compact menu-bar task radar and a full dashboard with task details.
 - Tracks token totals, daily trends, source coverage and six token categories when a client provides them.
-- Reads supported account quota windows through the clients' existing local authentication; credentials remain local to the client and are not stored in Agent Monitor.
+- Reads supported account quota windows through the clients' existing local authentication. Credentials are handled in memory for read-only provider requests and are not persisted by Agent Monitor.
 - Sends a bounded, read-only snapshot to an AI Passport over USB Serial/JTAG or encrypted BLE. The device can display tasks, alerts, quota windows and settings without approving, cancelling or executing work.
 - Keeps desktop notices, Tibo public reset announcements and their source timestamps separate from account state.
 - Retains history for 7 days, 30 days, 90 days or 1 year. Cleanup runs automatically and removes only terminal records and their usage; running and needs-action work is retained.
 - Includes connection diagnostics, provider health, refresh controls and local snapshot cleanup.
 
-The app is intentionally local-first. It stores lightweight metadata and deduplication state in its own SQLite database, never the prompt body, answer, raw JSONL, command output or account secret. Quota queries use the supported provider endpoint with authentication already present in the local client installation.
+The app is intentionally local-first. It stores task and session metadata, token summaries and deduplication state in its own SQLite database, never prompt or answer bodies, raw JSONL, command output or account secrets. Claude Code's local JSONL is parsed to derive task metadata and usage without retaining message bodies. Quota credentials are read in memory from supported local client stores and sent only to the corresponding provider quota endpoint; Agent Monitor does not persist them.
 
 ## Screenshots
 
@@ -73,7 +73,7 @@ The generated bundle is under `src-tauri/target/release/bundle/` and is intentio
 
 ## Data boundaries
 
-Agent Monitor starts a local Codex app-server session and reads provider-specific metadata or hook events. It does not routinely read full turns, prompts, answers, command output or raw JSONL. The Activity database stores task identity, status, timing, token summaries, source health and notification keys. Terminal history is pruned according to the retention setting.
+Agent Monitor starts a local Codex app-server session and reads provider-specific metadata or hook events. Codex sync avoids routine full-turn reads; Claude Code history is parsed locally to derive task status and usage. Message bodies, command output and source JSONL are not persisted. The Activity database stores task identity, project metadata, status, timing, token summaries, source health and notification keys. Terminal history is pruned according to the retention setting.
 
 AI Passport transport is a one-way projection of the local snapshot. USB uses Serial/JTAG; BLE uses the encrypted Nordic UART channel. The device has no command for approval, cancellation, retry or execution. Disconnects retain the last delivered snapshot and its age.
 
@@ -87,10 +87,10 @@ Agent Monitor 是一个本地只读的 macOS Agent 监控器，当前支持 Code
 
 - 任务雷达和完整控制台显示运行中、待处理、已完成、失败、中断任务及父子关系。
 - Token 用量页提供总量、每日趋势、来源覆盖率和可用的六类 Token 明细。
-- 账户额度通过客户端已有的本机认证查询，Agent Monitor 不保存账户密钥。
+- 账户额度通过客户端已有的本机认证查询；凭据仅在内存中用于只读额度请求，Agent Monitor 不会持久化凭据。
 - 设置中的历史保留时长支持 7 天、30 天、90 天和 1 年，定期清理已结束记录及其用量，运行中和待处理任务不会被清理。
 - AI Passport 仅接收只读状态快照，不能审批、取消、重试或执行任务。
-- 应用只保留轻量元数据和通知去重键，不保存提示词、回答、命令输出或原始 JSONL。
+- 应用保留任务、会话、项目路径等轻量元数据、Token 汇总和通知去重键，不保存提示词正文、回答正文、命令输出或原始 JSONL。Claude Code 本机 JSONL 会在本地解析以提取状态与用量，不保留消息正文。额度凭据仅在内存中用于请求对应账户额度，不会被应用持久化。
 
 当前源码构建是最新功能入口；公开的 `v0.1.0` DMG 仍是旧版 Codex-only 构建，尚未代表多客户端和 AI Passport 功能。相关 ESP32-C3 固件位于 [`lxxaisy/ai-passport`](https://github.com/lxxaisy/ai-passport)。
 
