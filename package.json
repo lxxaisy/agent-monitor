@@ -2,7 +2,7 @@
   "name": "agent-monitor",
   "private": true,
   "version": "0.1.0",
-  "description": "A local, read-only macOS monitor for Codex tasks",
+  "description": "A local, read-only macOS monitor for Codex, Claude Code and ZCode with optional AI Passport output",
   "license": "MIT",
   "repository": {
     "type": "git",

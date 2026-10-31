@@ -10,3 +10,13 @@ src-tauri/gen/
 vite.config.js
 vite.config.d.ts
 /main-*.js
+
+# Local credentials and signing material.
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+*.key
+*.mobileprovision
