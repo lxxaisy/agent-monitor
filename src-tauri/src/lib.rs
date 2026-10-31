@@ -1,16 +1,26 @@
+mod activity;
 mod adapter;
 mod codex;
+mod desktop_notices;
+mod hooks;
 mod model;
 mod monitor;
+mod passport;
+mod quota;
+mod reset_news;
+mod runtime;
+mod source_navigation;
 mod storage;
 
 use monitor::{MonitorService, MonitorSignal};
+pub use runtime::cli;
+use runtime::*;
 use serde_json::json;
 use std::sync::Arc;
 use std::thread;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{Emitter, Manager, State, WindowEvent};
+use tauri::{Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_autostart::ManagerExt as AutoStartManagerExt;
 #[cfg(not(target_os = "macos"))]
 use tauri_plugin_notification::NotificationExt;
@@ -34,8 +44,21 @@ fn get_task_detail(
 }
 
 #[tauri::command]
-fn sync_now(state: State<'_, AppState>) -> Result<model::DashboardSnapshot, String> {
-    state.0.sync_now().map_err(|error| error.to_string())
+async fn sync_now(
+    state: State<'_, AppState>,
+    runtime: State<'_, RuntimeState>,
+    app: tauri::AppHandle,
+) -> Result<model::DashboardSnapshot, String> {
+    let monitor = state.0.clone();
+    let services = runtime.0.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let snapshot = monitor.sync_now().map_err(|error| error.to_string())?;
+        let (_, fresh) = services.sync()?;
+        services.publish_alerts(&app, fresh)?;
+        Ok(snapshot)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -49,6 +72,14 @@ fn update_settings(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<model::Settings, String> {
+    if !(60..=3600).contains(&settings.notification_duration_seconds)
+        || settings.notification_duration_seconds % 60 != 0
+    {
+        return Err("提醒保留时长必须是 1–60 分钟的整数".into());
+    }
+    if !(7..=3650).contains(&settings.history_retention_days) {
+        return Err("历史保留时长必须是 7–3650 天".into());
+    }
     let saved = state
         .0
         .update_settings(settings.clone())
@@ -85,11 +116,16 @@ fn clear_local_history(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn get_diagnostics(state: State<'_, AppState>) -> Result<model::Diagnostics, String> {
-    state.0.diagnostics().map_err(|error| error.to_string())
+async fn get_diagnostics(state: State<'_, AppState>) -> Result<model::Diagnostics, String> {
+    let monitor = state.0.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        monitor.diagnostics().map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
-fn emit_notification(app: &tauri::AppHandle, notification: model::NotificationEvent) {
+pub(crate) fn emit_notification(app: &tauri::AppHandle, notification: model::NotificationEvent) {
     let _ = app.emit("monitor://notification", notification.clone());
     #[cfg(target_os = "macos")]
     {
@@ -108,7 +144,11 @@ fn emit_notification(app: &tauri::AppHandle, notification: model::NotificationEv
                 if let Ok(handle) = native.show() {
                     handle.wait_for_action(|action| {
                         if action != "__closed" {
-                            show_quick_window(&app);
+                            if task_id.starts_with("reset:") {
+                                show_main_window(&app);
+                            } else {
+                                show_quick_window(&app);
+                            }
                             let _ = app
                                 .emit("monitor://open-task-detail", json!({ "taskId": task_id }));
                         }
@@ -127,48 +167,42 @@ fn emit_notification(app: &tauri::AppHandle, notification: model::NotificationEv
     }
 }
 
-fn update_tray_summary(app: &tauri::AppHandle, snapshot: &model::DashboardSnapshot) {
-    let running = snapshot
-        .tasks
-        .iter()
-        .filter(|task| !task.archived && matches!(task.status, model::TaskStatus::Running))
-        .count();
-    let needs_action = snapshot
-        .tasks
-        .iter()
-        .filter(|task| !task.archived && matches!(task.status, model::TaskStatus::NeedsAction))
-        .count();
-    if let Some(tray) = app.tray_by_id("main-tray") {
-        let title = [(running, "运行"), (needs_action, "待办")]
-            .into_iter()
-            .filter(|(count, _)| *count > 0)
-            .map(|(count, label)| format!("{count}{label}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let _ = tray.set_title((!title.is_empty()).then_some(title));
-        let _ = tray.set_tooltip(Some(format!(
-            "Agent Monitor · 运行中 {} · 待处理 {}",
-            running, needs_action
-        )));
-    }
-}
-
 fn show_quick_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.hide();
+        if window.hide().is_ok() {
+            let _ = window.emit(
+                "monitor://window-visibility-changed",
+                json!({"label":"main","visible":false}),
+            );
+        }
     }
     if let Some(window) = app.get_webview_window("quick") {
-        let _ = window.show();
+        if window.show().is_ok() {
+            let _ = window.emit(
+                "monitor://window-visibility-changed",
+                json!({"label":"quick","visible":true}),
+            );
+        }
         let _ = window.set_focus();
     }
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("quick") {
-        let _ = window.hide();
+        if window.hide().is_ok() {
+            let _ = window.emit(
+                "monitor://window-visibility-changed",
+                json!({"label":"quick","visible":false}),
+            );
+        }
     }
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
+        if window.show().is_ok() {
+            let _ = window.emit(
+                "monitor://window-visibility-changed",
+                json!({"label":"main","visible":true}),
+            );
+        }
         let _ = window.set_focus();
     }
 }
@@ -222,6 +256,60 @@ fn position_quick_window(app: &tauri::AppHandle) {
     let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
 }
 
+pub(crate) fn update_notice_window(
+    app: &tauri::AppHandle,
+    notices: &[desktop_notices::DesktopNotice],
+) {
+    let _ = app.emit("monitor://desktop-notices-updated", notices);
+    let window = app.get_webview_window("notices").or_else(|| {
+        WebviewWindowBuilder::new(app, "notices", WebviewUrl::App("index.html".into()))
+            .title("Agent Monitor · 提醒")
+            .inner_size(420.0, 140.0)
+            .resizable(false)
+            .maximizable(false)
+            .minimizable(false)
+            .focused(false)
+            .decorations(false)
+            .transparent(true)
+            .always_on_top(true)
+            .visible_on_all_workspaces(true)
+            .skip_taskbar(true)
+            .shadow(true)
+            .visible(false)
+            .build()
+            .ok()
+    });
+    let Some(window) = window else {
+        return;
+    };
+    if notices.is_empty() {
+        if window.hide().is_ok() {
+            let _ = window.emit(
+                "monitor://window-visibility-changed",
+                json!({"label":"notices","visible":false}),
+            );
+        }
+        return;
+    }
+    let height = 16.0 + notices.len().min(3) as f64 * 124.0;
+    let _ = window.set_size(tauri::LogicalSize::new(420.0, height));
+    if let Ok(Some(monitor)) = window.primary_monitor() {
+        let area = monitor.work_area();
+        let scale = monitor.scale_factor();
+        let margin = (16.0 * scale) as i32;
+        let width = (420.0 * scale) as i32;
+        let x = (area.position.x + area.size.width as i32 - width - margin)
+            .max(area.position.x + margin);
+        let _ = window.set_position(tauri::PhysicalPosition::new(x, area.position.y + margin));
+    }
+    if window.show().is_ok() {
+        let _ = window.emit(
+            "monitor://window-visibility-changed",
+            json!({"label":"notices","visible":true}),
+        );
+    }
+}
+
 fn forward_signals(app: tauri::AppHandle, receiver: std::sync::mpsc::Receiver<MonitorSignal>) {
     thread::Builder::new()
         .name("agent-monitor-events".into())
@@ -237,49 +325,13 @@ fn forward_signals(app: tauri::AppHandle, receiver: std::sync::mpsc::Receiver<Mo
                 };
                 match signal {
                     MonitorSignal::SnapshotUpdated(snapshot) => {
-                        update_tray_summary(&app, &snapshot);
                         let _ = app.emit("monitor://snapshot-updated", snapshot);
                     }
                     MonitorSignal::TaskUpdated(task) => {
                         let _ = app.emit("monitor://task-updated", task);
                     }
-                    MonitorSignal::Notification(notification) => {
-                        let mut notifications = vec![notification];
-                        let deadline = std::time::Duration::from_millis(350);
-                        loop {
-                            match receiver.recv_timeout(deadline) {
-                                Ok(MonitorSignal::Notification(next)) => notifications.push(next),
-                                Ok(other) => {
-                                    pending = Some(other);
-                                    break;
-                                }
-                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
-                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                            }
-                        }
-                        if notifications.len() == 1 {
-                            emit_notification(&app, notifications.remove(0));
-                        } else {
-                            let body = notifications
-                                .iter()
-                                .map(|item| item.title.as_str())
-                                .collect::<Vec<_>>()
-                                .join("、");
-                            emit_notification(
-                                &app,
-                                model::NotificationEvent {
-                                    event_type: "batch".into(),
-                                    task_id: notifications
-                                        .first()
-                                        .map(|item| item.task_id.clone())
-                                        .unwrap_or_default(),
-                                    turn_id: None,
-                                    title: format!("{} 个任务状态更新", notifications.len()),
-                                    body,
-                                },
-                            );
-                        }
-                    }
+                    // All clients now share the persistent per-turn notification ledger.
+                    MonitorSignal::Notification(_) => {}
                     MonitorSignal::ConnectionChanged(sync) => {
                         let _ = app.emit("monitor://connection-changed", sync);
                     }
@@ -321,12 +373,16 @@ pub fn run() {
                     Some(error.to_string()),
                 ),
             };
-            let service = MonitorService::new(store).map_err(|error| error.to_string())?;
+            let service = MonitorService::new(store.clone()).map_err(|error| error.to_string())?;
             if let Some(error) = storage_error {
                 let _ = service.set_storage_degraded(format!("本地快照数据库不可用: {error}"));
             }
             let receiver = service.subscribe();
             service.start_background();
+            let services = Services::new(service.clone(), store)?;
+            services.passport.resume()?;
+            app.manage(RuntimeState(services.clone()));
+            services.start(Some(app.handle().clone()), true);
             app.manage(AppState(service));
             position_quick_window(app.handle());
             if !cfg!(debug_assertions)
@@ -346,11 +402,7 @@ pub fn run() {
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &console, &sync, &quit])?;
             TrayIconBuilder::with_id("main-tray")
-                .icon(
-                    app.default_window_icon()
-                        .cloned()
-                        .expect("default icon is configured"),
-                )
+                .icon(tauri::include_image!("icons/tray-template.png"))
                 .icon_as_template(true)
                 .menu(&menu)
                 .show_menu_on_left_click(false)
@@ -386,7 +438,12 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = window.hide();
+                if window.hide().is_ok() {
+                    let _ = window.emit(
+                        "monitor://window-visibility-changed",
+                        json!({"label":window.label(),"visible":false}),
+                    );
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -398,8 +455,30 @@ pub fn run() {
             show_quick,
             show_main,
             open_task,
+            open_execution,
             clear_local_history,
-            get_diagnostics
+            get_diagnostics,
+            get_desktop_notices,
+            dismiss_desktop_notice,
+            open_desktop_notice,
+            get_activity_snapshot,
+            get_execution_history,
+            get_session_history,
+            get_execution_detail,
+            get_quota_snapshot,
+            refresh_quotas,
+            get_reset_news,
+            refresh_reset_news,
+            update_reset_news,
+            open_reset_post,
+            get_passport_state,
+            list_passport_usb_ports,
+            scan_passport_ble,
+            connect_passport,
+            disconnect_passport,
+            update_passport_settings,
+            get_alerts,
+            acknowledge_alert
         ])
         .run(tauri::generate_context!())
         .expect("error while running Agent Monitor");

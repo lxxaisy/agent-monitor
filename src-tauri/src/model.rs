@@ -143,13 +143,39 @@ pub struct DashboardSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub enum ThemePreference {
+    System,
+    Light,
+    Dark,
+}
+
+fn default_theme() -> ThemePreference {
+    ThemePreference::System
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct Settings {
     pub codex_path: Option<String>,
     pub codex_home: Option<String>,
     pub refresh_interval_seconds: u64,
+    #[serde(default = "default_history_retention_days")]
+    pub history_retention_days: u16,
     pub launch_at_login: bool,
     pub notifications_enabled: bool,
+    #[serde(default = "default_notification_duration_seconds")]
+    pub notification_duration_seconds: u64,
     pub show_prompt_preview: bool,
+    #[serde(default = "default_theme")]
+    pub theme: ThemePreference,
+}
+
+fn default_notification_duration_seconds() -> u64 {
+    300
+}
+
+fn default_history_retention_days() -> u16 {
+    crate::activity::DEFAULT_HISTORY_RETENTION_DAYS
 }
 
 impl Default for Settings {
@@ -158,9 +184,12 @@ impl Default for Settings {
             codex_path: None,
             codex_home: None,
             refresh_interval_seconds: 15,
+            history_retention_days: default_history_retention_days(),
             launch_at_login: true,
             notifications_enabled: true,
+            notification_duration_seconds: default_notification_duration_seconds(),
             show_prompt_preview: false,
+            theme: default_theme(),
         }
     }
 }
@@ -611,6 +640,31 @@ mod tests {
 
         assert_eq!(summaries[0].failed_count, 1);
         assert_eq!(summaries[0].interrupted_count, 1);
+    }
+
+    #[test]
+    fn new_notice_preference_defaults_to_five_minutes_without_resetting_saved_settings() {
+        let mut saved = serde_json::to_value(Settings::default()).unwrap();
+        saved["notificationsEnabled"] = false.into();
+        saved["refreshIntervalSeconds"] = 37.into();
+        saved
+            .as_object_mut()
+            .unwrap()
+            .remove("notificationDurationSeconds");
+        let loaded: Settings = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(loaded.notification_duration_seconds, 300);
+        assert_eq!(loaded.history_retention_days, 30);
+        assert_eq!(loaded.theme, ThemePreference::System);
+        assert_eq!(serde_json::to_value(&loaded).unwrap()["theme"], "system");
+        assert!(!loaded.notifications_enabled);
+        assert_eq!(loaded.refresh_interval_seconds, 37);
+        saved["notificationDurationSeconds"] = 0.into();
+        assert_eq!(
+            serde_json::from_value::<Settings>(saved)
+                .unwrap()
+                .notification_duration_seconds,
+            0
+        );
     }
 
     #[test]

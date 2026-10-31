@@ -45,6 +45,49 @@ compatibility mode and never changes a task to failed. Prompt, response, and
 command-output fields are neither retained nor exposed. Internal chat
 passthrough UUIDs are not treated as provider turn IDs.
 
+If discovery omits a live session, ordinary tool items for the same observed
+turn keep updating its file evidence without repeating a full thread listing.
+New sessions and turn boundaries still trigger discovery; scheduled metadata
+reconciliation continues. User-input requests are parsed and queued independently
+of whether the session already has API metadata.
+
+The activity collector reuses its prepared request-usage upsert statement.
+ZCode request rows remain ordered by `started_at,id`; the final model/provider
+pair in that existing order is applied once per turn, skipping identical values.
+All request usage is still checked, including corrections in old rows after a
+WAL change. This avoids per-request turn-metadata rewrites without delaying
+live hooks or changing Token/missing-value semantics.
+
+Unchanged execution and metadata upserts do not write to SQLite. A collection
+reuses its derived activity cache when persisted data, source health and live
+evidence are unchanged, while updating displayed durations and freshness.
+
+History retention defaults to 30 days. Cleanup runs at startup, every six hours,
+and after a retention-setting change; it removes only expired terminal turns
+and their request usage. The saved cleanup cutoff also excludes expired terminal
+turns on subsequent imports so source history cannot restore deleted rows.
+Ongoing turns keep their usage, and unread alerts are retained. The setting is
+available in the installed application's Settings and Diagnostics page.
+
+Diagnostic version probes run off the UI thread and outside the collector state
+lock, with a two-second subprocess deadline. Output uses a private, bounded
+regular-file capture rather than waiting for pipe EOF, which can be retained by
+an independently spawned app-server. A path change during the query discards
+the old binary's version instead of associating it with the new path.
+
+Activity collection owns an immediate SQLite transaction. Any early error or
+failed commit rolls it back before the next refresh, while source-specific
+savepoints continue to isolate unavailable clients. A failed manual sync has a
+retry action and clears when a later collection succeeds.
+
+BLE scans and reconnects share one lazily initialized adapter on Tauri's
+persistent async runtime. The macOS btleplug backend keeps a CoreBluetooth
+thread alive per adapter; recreating it on every reconnect accumulated kqueue
+descriptors until SQLite and source files failed to open. Failed adapter
+initialization remains retryable. The macOS resource regression exercises 32
+adapter acquisitions and local snapshot writes without scanning or connecting
+to a device; run it explicitly with Bluetooth access and one test thread.
+
 Codex `source` values are normalized before they cross the adapter boundary.
 Both string values and object-shaped sub-agent variants map to stable source
 kinds such as `vscode`, `subAgentReview`, and `subAgentThreadSpawn`; unknown
@@ -68,6 +111,49 @@ identifier for future provider adapters.
 storage layers do not depend on provider-specific JSON shapes.
 
 ## Desktop surfaces
+
+History is paginated by `(client, sessionId)` before returning results to the
+view. A conversation summary reports its latest matching root round, matching
+round count, descendant count and normalized Token totals. Root records already
+contain descendant request usage, so conversation totals sum roots exactly once.
+Expanding a conversation fetches its root rounds in pages of ten; opening a round
+keeps child Agents under that round. Status filters scope both the displayed
+round count and totals. Source titles remain unchanged in storage. List previews
+use the first task line after the known browser-context and attachment envelope;
+ordinary XML and other document headings are preserved. Detail exposes the
+complete original source separately from the compact round heading. No project,
+path or sibling field replaces an empty title.
+Child rows always use their Agent/round identity as the main label and keep
+their source title as secondary text, even when it is empty. A leading Markdown
+link in a list preview displays its label once; the source remains unchanged.
+
+The separate child-Agent history uses `childrenOnly` to retain access to every
+visible child record, including records whose source does not identify a root
+round. It keeps its own pagination and filters; those records do not add root
+tasks or get added a second time to a conversation's rolled-up usage.
+
+Tibo announcements have their own navigation destination. The latest stored
+post remains visible on Overview and the default quick window, including when
+polling is paused or the source is stale. Publication time and source freshness
+remain distinct from the account's actual reset state. Only the existing native
+news update event refreshes these surfaces; there is no extra polling timer.
+Saving announcement settings broadcasts the same update event to the other
+windows immediately. Encoded public post text is decoded with the browser's HTML
+parser and rendered as text, without interpreting its markup.
+
+Explicit named clocks such as “By midnight PST” are anchored to the post's day
+in the stated offset; midnight is the end of that source day. Timing metadata
+preserves whether the source describes a deadline, a point or a relative window.
+The console, overview and quick window render that timestamp in the machine's
+timezone, retaining deadline wording without claiming the reset has completed.
+
+The main sidebar and quick window use macOS semantic vibrancy materials; their
+CSS adds restrained edge highlights and follows the system color scheme.
+The content workspace stays opaque for readability. Browser fixture screenshots
+verify CSS only and do not establish native vibrancy acceptance.
+Quick-window task rows do not use opacity entrance animation: native WebKit
+capture showed blank composited rows while their accessibility text remained
+present. Hover/pressed transitions and the detail animation remain independent.
 
 The `quick` window is the default glance surface. It is a small undecorated,
 cross-workspace window initially positioned at the top-right of the current

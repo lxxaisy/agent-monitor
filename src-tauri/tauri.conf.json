@@ -23,7 +23,9 @@
         "resizable": true,
         "fullscreen": false,
         "visible": false,
-        "decorations": true
+        "decorations": true,
+        "transparent": true,
+        "windowEffects": { "effects": ["sidebar"], "state": "followsWindowActiveState" }
       },
       {
         "label": "quick",
@@ -40,6 +42,7 @@
         "visible": true,
         "decorations": false,
         "transparent": true,
+        "windowEffects": { "effects": ["popover"], "state": "followsWindowActiveState", "radius": 8 },
         "alwaysOnTop": false,
         "visibleOnAllWorkspaces": true,
         "skipTaskbar": true,

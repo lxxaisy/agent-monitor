@@ -64,13 +64,30 @@ struct CachedPlan {
 }
 
 #[derive(Debug, Clone)]
+struct PendingSessionCall {
+    call_id: Option<String>,
+    attention: AttentionKind,
+    remaining_questions: Option<HashSet<usize>>,
+}
+
+#[derive(Debug, Clone)]
 struct SessionActiveTurn {
     turn_id: Option<String>,
     observed_at: Option<String>,
     session_path: Option<PathBuf>,
     last_seen: Instant,
     attention: Option<AttentionKind>,
-    pending_call_id: Option<String>,
+    pending_calls: Vec<PendingSessionCall>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InputRequest {
+    pub id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    call_id: String,
+    remaining_questions: HashSet<usize>,
+    accepted: bool,
 }
 
 struct MonitorInner {
@@ -90,6 +107,9 @@ struct MonitorInner {
     dirty_task_ids: HashSet<String>,
     session_active_turns: HashMap<String, SessionActiveTurn>,
     persistent_degradation: Option<String>,
+    version_cache: Option<(PathBuf, Option<String>)>,
+    started_at: DateTime<chrono::Utc>,
+    input_requests: Vec<InputRequest>,
 }
 
 #[derive(Clone)]
@@ -156,6 +176,9 @@ impl MonitorService {
                 dirty_task_ids: HashSet::new(),
                 session_active_turns: HashMap::new(),
                 persistent_degradation: None,
+                version_cache: None,
+                started_at: chrono::Utc::now(),
+                input_requests: Vec::new(),
             })),
             sync_lock: Arc::new(Mutex::new(())),
         })
@@ -167,6 +190,67 @@ impl MonitorService {
             inner.listeners.push(sender);
         }
         receiver
+    }
+
+    pub fn pending_input_requests(&self) -> Result<Vec<InputRequest>, MonitorError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| MonitorError::StateUnavailable)?
+            .input_requests
+            .iter()
+            .filter(|request| request.accepted)
+            .cloned()
+            .collect())
+    }
+
+    pub fn session_activity(&self) -> Result<Vec<crate::codex::SessionActivity>, MonitorError> {
+        let sessions: Vec<_> = self
+            .inner
+            .lock()
+            .map_err(|_| MonitorError::StateUnavailable)?
+            .session_active_turns
+            .iter()
+            .map(|(id, active)| (id.clone(), active.clone()))
+            .collect();
+        let mut live = Vec::new();
+        let mut expired = Vec::new();
+        for (id, active) in sessions {
+            if session_active_turn_is_live(&active) {
+                if let Some(turn_id) = active.turn_id {
+                    live.push(crate::codex::SessionActivity {
+                        session_id: id,
+                        turn_id,
+                        attention: active.attention,
+                    });
+                }
+            } else {
+                expired.push((id, active.last_seen));
+            }
+        }
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| MonitorError::StateUnavailable)?;
+        for (id, last_seen) in expired {
+            if inner
+                .session_active_turns
+                .get(&id)
+                .is_some_and(|active| active.last_seen == last_seen)
+            {
+                inner.session_active_turns.remove(&id);
+            }
+        }
+        Ok(live)
+    }
+
+    pub fn consume_input_requests(&self, ids: &[String]) -> Result<(), MonitorError> {
+        self.inner
+            .lock()
+            .map_err(|_| MonitorError::StateUnavailable)?
+            .input_requests
+            .retain(|request| !ids.contains(&request.id));
+        Ok(())
     }
 
     fn broadcast(inner: &mut MonitorInner, signal: MonitorSignal) {
@@ -333,19 +417,32 @@ impl MonitorService {
     }
 
     pub fn diagnostics(&self) -> Result<Diagnostics, MonitorError> {
-        let inner = self
+        let (binary, cached) = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| MonitorError::StateUnavailable)?;
+            (inner.sync.codex_path.clone(), inner.version_cache.clone())
+        };
+        let version = if binary.is_empty() {
+            None
+        } else if let Some((_, version)) = cached.filter(|(path, _)| path == Path::new(&binary)) {
+            version
+        } else {
+            crate::codex::codex_version(Path::new(&binary))
+        };
+        let mut inner = self
             .inner
             .lock()
             .map_err(|_| MonitorError::StateUnavailable)?;
-        let binary = if inner.sync.codex_path.is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(&inner.sync.codex_path))
-        };
+        let same_binary = inner.sync.codex_path == binary;
+        if same_binary && !binary.is_empty() {
+            inner.version_cache = Some((PathBuf::from(binary), version.clone()));
+        }
         Ok(Diagnostics {
             codex_path: inner.sync.codex_path.clone(),
             codex_home: inner.sync.codex_home.clone(),
-            codex_version: binary.as_deref().and_then(crate::codex::codex_version),
+            codex_version: if same_binary { version } else { None },
             connection_status: inner.sync.status.clone(),
             transport: "stdio".into(),
             compatibility_mode: inner.sync.compatibility_mode,
@@ -382,6 +479,25 @@ impl MonitorService {
     pub fn sync_now(&self) -> Result<DashboardSnapshot, MonitorError> {
         self.sync_once(true)?;
         self.snapshot()
+    }
+
+    pub fn account_rate_limits(&self) -> Result<Value, String> {
+        let _sync = self
+            .sync_lock
+            .try_lock()
+            .map_err(|_| "Codex 正在同步，稍后刷新额度")?;
+        let client = self
+            .inner
+            .lock()
+            .map_err(|_| "Codex 状态不可用")?
+            .client
+            .take()
+            .ok_or("Codex 尚未连接，无法读取账户额度")?;
+        let result = client
+            .account_rate_limits()
+            .map_err(|_| "Codex 账户额度读取失败，请检查原客户端登录".to_string());
+        self.inner.lock().map_err(|_| "Codex 状态不可用")?.client = Some(client);
+        result
     }
 
     fn emit_connection(inner: &mut MonitorInner) {
@@ -429,6 +545,7 @@ impl MonitorService {
             inner.sync.codex_home = codex_home.display().to_string();
             let client = inner.client.take().filter(|client| client.is_alive());
             if client.is_none() {
+                inner.version_cache = None;
                 inner.sync.status = "connecting".into();
                 Self::emit_connection(&mut inner);
             }
@@ -778,11 +895,13 @@ impl MonitorService {
         }
         let path_task_id = session_task_id(&path);
         let mut relevant = false;
+        let mut reconcile = false;
         let mut relevant_task_ids = HashSet::new();
         for event in &mut events {
             if event.task_id.is_none() {
                 event.task_id = path_task_id.clone();
             }
+            track_input_request(&mut inner, event);
             if let (Some(turn_id), Some(plan)) = (event.turn_id.as_ref(), event.plan.take()) {
                 inner.plan_cache.insert(
                     turn_id.clone(),
@@ -793,9 +912,47 @@ impl MonitorService {
                 );
             }
 
-            if session_event_lifecycle(&event.kind) != SessionLifecycle::None {
-                relevant = true;
+            let lifecycle = session_event_lifecycle(&event.kind);
+            if lifecycle != SessionLifecycle::None {
+                let previous_active = event
+                    .task_id
+                    .as_ref()
+                    .and_then(|task_id| inner.session_active_turns.get(task_id))
+                    .cloned();
                 if let Some(task_id) = apply_session_event(&mut inner, event, Some(&path)) {
+                    relevant = true;
+                    match (
+                        lifecycle,
+                        inner.session_active_turns.get(&task_id).cloned(),
+                        inner.details.get(&task_id).cloned(),
+                    ) {
+                        (SessionLifecycle::Active, Some(active), Some(mut detail))
+                            if !detail.snapshot.archived
+                                && !session_override_is_reconciled(&detail, &active) =>
+                        {
+                            apply_session_active_turn(&mut detail, &active, &now_rfc3339());
+                            if let Some(plan) = active
+                                .turn_id
+                                .as_ref()
+                                .and_then(|turn| inner.plan_cache.get(turn))
+                            {
+                                apply_cached_plan(&mut detail, plan);
+                            }
+                            inner.tasks.insert(task_id.clone(), detail.snapshot.clone());
+                            inner.details.insert(task_id.clone(), detail);
+                        }
+                        (SessionLifecycle::Active, Some(active), None)
+                            if !matches!(event.kind.as_str(), "task_started" | "turn_started")
+                                && previous_active
+                                    .as_ref()
+                                    .is_some_and(|previous| previous.turn_id == active.turn_id) =>
+                        {
+                            // Discovery may omit an in-flight session. Its next tool item
+                            // cannot make the same full listing useful; keep the live
+                            // evidence and let scheduled discovery or a turn boundary retry.
+                        }
+                        _ => reconcile = true,
+                    }
                     relevant_task_ids.insert(task_id);
                 }
             }
@@ -806,12 +963,12 @@ impl MonitorService {
             } else {
                 inner.dirty_task_ids.extend(relevant_task_ids);
             }
-            if inner.client.is_some() {
+            if reconcile && inner.client.is_some() {
                 inner.next_retry_at = Instant::now();
             }
         }
         drop(inner);
-        if relevant {
+        if reconcile {
             self.sync_once(false)?;
         }
         Ok(())
@@ -1089,28 +1246,7 @@ fn event_turn_id(params: &Value) -> Option<&str> {
 }
 
 fn session_task_id(path: &Path) -> Option<String> {
-    let name = path.file_name()?.to_str()?;
-    let stem = name.strip_suffix(".jsonl")?;
-    if let Some(candidate) = stem.rsplit('_').next().filter(|value| is_uuid(value)) {
-        return Some(candidate.to_string());
-    }
-    let pieces: Vec<&str> = stem.split('-').collect();
-    if pieces.len() < 6 {
-        return None;
-    }
-    let candidate = pieces[pieces.len() - 5..].join("-");
-    is_uuid(&candidate).then_some(candidate)
-}
-
-fn is_uuid(value: &str) -> bool {
-    value.len() == 36
-        && value.chars().enumerate().all(|(index, character)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                character == '-'
-            } else {
-                character.is_ascii_hexdigit()
-            }
-        })
+    crate::codex::rollout_session_ids(path).map(|(conversation, _)| conversation)
 }
 
 #[cfg(unix)]
@@ -1141,10 +1277,67 @@ fn session_event_lifecycle(kind: &str) -> SessionLifecycle {
         | "custom_tool_call_output"
         | "function_call"
         | "function_call_output"
+        | "question_reply"
         | "exec_approval_request"
         | "apply_patch_approval_request" => SessionLifecycle::Active,
         "task_complete" | "turn_aborted" => SessionLifecycle::Terminal,
         _ => SessionLifecycle::None,
+    }
+}
+
+fn track_input_request(inner: &mut MonitorInner, event: &SessionEvent) {
+    let Some(session_id) = event.task_id.as_deref() else {
+        return;
+    };
+    inner.input_requests.retain_mut(|request| {
+        if request.session_id == session_id {
+            if event.rejected_input_call && event.call_id.as_deref() == Some(&request.call_id) {
+                return false;
+            }
+            if event.accepted_input_call && event.call_id.as_deref() == Some(&request.call_id) {
+                request.accepted = true;
+            }
+            for (call_id, index) in &event.answered_questions {
+                if &request.call_id == call_id {
+                    request.remaining_questions.remove(index);
+                }
+            }
+        }
+        !request.remaining_questions.is_empty()
+    });
+    let (Some(count), Some(call_id), Some(observed)) = (
+        event.async_question_count,
+        event.call_id.as_deref(),
+        event
+            .observed_at
+            .as_deref()
+            .and_then(|at| DateTime::parse_from_rfc3339(at).ok()),
+    ) else {
+        return;
+    };
+    // Only incremental requests created during this run may produce new alerts.
+    // Baseline tails are read separately, and old/replayed records stay silent.
+    if observed < inner.started_at {
+        return;
+    }
+    let Some(turn_id) = event.turn_id.as_deref().or_else(|| {
+        inner
+            .session_active_turns
+            .get(session_id)
+            .and_then(|active| active.turn_id.as_deref())
+    }) else {
+        return;
+    };
+    let id = format!("codex:{session_id}:{turn_id}:needs_action:input:{call_id}");
+    if !inner.input_requests.iter().any(|request| request.id == id) {
+        inner.input_requests.push(InputRequest {
+            id,
+            session_id: session_id.into(),
+            turn_id: turn_id.into(),
+            call_id: call_id.into(),
+            remaining_questions: (0..count).collect(),
+            accepted: false,
+        });
     }
 }
 
@@ -1167,33 +1360,65 @@ fn apply_session_event(
                             .and_then(|active| active.turn_id.as_deref()),
                     )
                     .is_some_and(|(current, previous)| current != previous);
-            let resolves_pending_call = matches!(
+            let mut pending_calls = if new_turn {
+                Vec::new()
+            } else {
+                previous
+                    .as_ref()
+                    .map(|active| active.pending_calls.clone())
+                    .unwrap_or_default()
+            };
+            if event.kind == "question_reply"
+                && !event.answered_questions.iter().any(|(call_id, index)| {
+                    pending_calls.iter().any(|pending| {
+                        pending.call_id.as_deref() == Some(call_id.as_str())
+                            && pending
+                                .remaining_questions
+                                .as_ref()
+                                .is_some_and(|remaining| remaining.contains(index))
+                    })
+                })
+            {
+                return None;
+            }
+            for (call_id, index) in &event.answered_questions {
+                pending_calls.retain_mut(|pending| {
+                    if pending.call_id.as_deref() == Some(call_id.as_str()) {
+                        if let Some(remaining) = &mut pending.remaining_questions {
+                            remaining.remove(index);
+                            return !remaining.is_empty();
+                        }
+                    }
+                    true
+                });
+            }
+            if matches!(
                 event.kind.as_str(),
                 "function_call_output" | "custom_tool_call_output"
-            ) && event.call_id.as_deref().is_some_and(|call_id| {
-                previous
-                    .as_ref()
-                    .and_then(|active| active.pending_call_id.as_deref())
-                    == Some(call_id)
-            });
-            let attention = if let Some(attention) = event.attention.clone() {
-                Some(attention)
-            } else if new_turn || resolves_pending_call {
-                None
-            } else {
-                previous
-                    .as_ref()
-                    .and_then(|active| active.attention.clone())
-            };
-            let pending_call_id = if event.attention.is_some() {
-                event.call_id.clone()
-            } else if new_turn || resolves_pending_call {
-                None
-            } else {
-                previous
-                    .as_ref()
-                    .and_then(|active| active.pending_call_id.clone())
-            };
+            ) {
+                if let Some(call_id) = &event.call_id {
+                    pending_calls.retain(|pending| {
+                        pending.call_id.as_ref() != Some(call_id)
+                            || (pending.remaining_questions.is_some() && !event.rejected_input_call)
+                    });
+                }
+            }
+            if let Some(attention) = &event.attention {
+                if !pending_calls.iter().any(|pending| {
+                    pending.call_id == event.call_id && pending.attention == *attention
+                }) {
+                    pending_calls.push(PendingSessionCall {
+                        call_id: event.call_id.clone(),
+                        attention: attention.clone(),
+                        remaining_questions: event
+                            .async_question_count
+                            .map(|count| (0..count).collect()),
+                    });
+                }
+            }
+            let attention = pending_calls
+                .last()
+                .map(|pending| pending.attention.clone());
             inner.session_active_turns.insert(
                 task_id.clone(),
                 SessionActiveTurn {
@@ -1213,7 +1438,7 @@ fn apply_session_event(
                     }),
                     last_seen: Instant::now(),
                     attention,
-                    pending_call_id,
+                    pending_calls,
                 },
             );
         }
@@ -1659,7 +1884,180 @@ mod tests {
             session_task_id(path).as_deref(),
             Some("00000000-0000-4000-8000-000000000001")
         );
+        let resumed = Path::new("/tmp/rollout-2026-10-23T09-48-50-01a158b5-42da-7e73-bdaf-91895cb36ace_01a16672-52e1-7df0-9b98-63a9846c7e40.jsonl");
+        assert_eq!(
+            session_task_id(resumed).as_deref(),
+            Some("01a158b5-42da-7e73-bdaf-91895cb36ace"),
+            "resume suffix is a run identity, not the conversation"
+        );
         assert_eq!(session_task_id(Path::new("/tmp/not-a-rollout.jsonl")), None);
+    }
+
+    #[test]
+    fn resumed_rollout_routes_accepted_input_to_the_conversation_and_waits_for_acceptance() {
+        let root = std::env::temp_dir().join(format!(
+            "monitor-resume-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path=root.join("rollout-2026-10-23T09-48-50-01a158b5-42da-7e73-bdaf-91895cb36ace_01a16672-52e1-7df0-9b98-63a9846c7e40.jsonl");
+        let store = Arc::new(SnapshotStore::open_in_memory().unwrap());
+        store
+            .save_settings(&Settings {
+                codex_path: Some(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/fake-codex.sh")
+                        .display()
+                        .to_string(),
+                ),
+                codex_home: Some(root.display().to_string()),
+                ..Settings::default()
+            })
+            .unwrap();
+        let service = MonitorService::new(store).unwrap();
+        let at = now_rfc3339();
+        let rows = [
+            serde_json::json!({"timestamp":at,"type":"event_msg","payload":{"type":"task_started","thread_id":"01a158b5-42da-7e73-bdaf-91895cb36ace","turn_id":"turn"}}),
+            serde_json::json!({"timestamp":at,"type":"response_item","payload":{"type":"function_call","name":"request_user_input_async","call_id":"question","arguments":"{\"questions\":[{}]}"}}),
+        ];
+        std::fs::write(
+            &path,
+            rows.iter()
+                .map(|row| format!("{row}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        service.process_session_path(path.clone()).unwrap();
+        assert!(
+            service.pending_input_requests().unwrap().is_empty(),
+            "an unaccepted call must not notify"
+        );
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file,"{}",serde_json::json!({"timestamp":at,"type":"response_item","payload":{"type":"function_call_output","call_id":"question","output":"{\"accepted\":true}"}})).unwrap();
+        file.flush().unwrap();
+        service.process_session_path(path).unwrap();
+        let requests = service.pending_input_requests().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].session_id,
+            "01a158b5-42da-7e73-bdaf-91895cb36ace"
+        );
+        assert_eq!(requests[0].turn_id, "turn");
+        drop(file);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "Replays only control metadata from user-specified local examples; no native app"]
+    fn local_reported_input_examples_replay() {
+        use std::io::BufRead;
+        let source = rusqlite::Connection::open_with_flags(
+            dirs::home_dir().unwrap().join(".codex/state_5.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        for (session, through, expected_pending) in [
+            (
+                "01a16676-36e3-7a73-a59c-a12286d4c87f",
+                "2026-10-23T03:40:56Z",
+                0,
+            ),
+            (
+                "01a158b5-42da-7e73-bdaf-91895cb36ace",
+                "2026-10-23T03:44:42Z",
+                1,
+            ),
+        ] {
+            let path: String = source
+                .query_row(
+                    "SELECT rollout_path FROM threads WHERE id=?1",
+                    [session],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let service =
+                MonitorService::new(Arc::new(SnapshotStore::open_in_memory().unwrap())).unwrap();
+            let mut inner = service.inner.lock().unwrap();
+            inner.started_at = DateTime::parse_from_rfc3339("2026-10-23T03:39:00Z")
+                .unwrap()
+                .to_utc();
+            for line in std::io::BufReader::new(File::open(&path).unwrap()).lines() {
+                let value: Value = serde_json::from_str(&line.unwrap()).unwrap();
+                if value
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .is_some_and(|at| at > through)
+                {
+                    break;
+                }
+                if let Some(mut event) = crate::codex::parse_session_event(&value) {
+                    if event.task_id.is_none() {
+                        event.task_id = session_task_id(Path::new(&path));
+                    }
+                    track_input_request(&mut inner, &event);
+                    apply_session_event(&mut inner, &event, Some(Path::new(&path)));
+                }
+            }
+            assert_eq!(
+                inner
+                    .input_requests
+                    .iter()
+                    .filter(|request| request.accepted)
+                    .count(),
+                expected_pending
+            );
+            assert_eq!(
+                inner.session_active_turns[session].attention,
+                if expected_pending == 0 {
+                    None
+                } else {
+                    Some(AttentionKind::UserInput)
+                }
+            );
+            println!("replay session={session} accepted_pending={expected_pending} through={through}: PASS");
+            drop(inner);
+            if expected_pending == 1 {
+                let database = std::env::var("AGENT_MONITOR_ACTIVITY_QA_DB")
+                    .expect("isolated ledger path required");
+                let store = Arc::new(SnapshotStore::open_in_memory().unwrap());
+                let services = crate::runtime::Services {
+                    monitor: service,
+                    activity: Arc::new(
+                        crate::activity::ActivityService::open(dirs::home_dir().unwrap(), database)
+                            .unwrap(),
+                    ),
+                    quota: Arc::new(crate::quota::QuotaService::new().unwrap()),
+                    news: Arc::new(crate::reset_news::ResetNews::new(store.clone()).unwrap()),
+                    passport: Arc::new(crate::passport::CompanionService::new(store).unwrap()),
+                    notices: crate::desktop_notices::DesktopNotices::default(),
+                };
+                assert!(services.monitor.snapshot().unwrap().tasks.is_empty());
+                let (snapshot, alerts) = services.sync().unwrap();
+                let task_id = format!("codex:{session}:01a166db-daf5-7232-9a74-e2987f92c0a5");
+                let record = snapshot
+                    .executions
+                    .iter()
+                    .find(|record| record.id == task_id)
+                    .unwrap();
+                assert_eq!(record.status, TaskStatus::NeedsAction);
+                assert!(record.started_at.is_some());
+                assert!(record.tokens.total.is_some());
+                assert_eq!(
+                    alerts
+                        .iter()
+                        .filter(|alert| alert.task_id == task_id && alert.kind == "needs_action")
+                        .count(),
+                    1
+                );
+                assert!(services.sync().unwrap().1.is_empty());
+                println!("resumed chat: native history -> canonical ledger -> needs_action -> one persistent alert, API list empty: PASS");
+            }
+        }
     }
 
     #[test]
@@ -2270,6 +2668,568 @@ mod tests {
         assert_eq!(resumed.status, TaskStatus::Running);
         assert_eq!(resumed.attention, None);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn async_question_and_terminal_in_one_batch_retains_input_without_reviving_turn() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-monitor-batched-input-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Arc::new(SnapshotStore::open_in_memory().unwrap());
+        store
+            .save_settings(&Settings {
+                codex_path: Some(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/fake-codex.sh")
+                        .display()
+                        .to_string(),
+                ),
+                codex_home: Some(root.display().to_string()),
+                ..Settings::default()
+            })
+            .unwrap();
+        let service = MonitorService::new(store.clone()).unwrap();
+        service.sync_now().unwrap();
+        let path = root.join("rollout.jsonl");
+        let at = now_rfc3339();
+        let lines = [
+            serde_json::json!({"timestamp":at,"type":"event_msg","payload":{"type":"task_started","threadId":"fake-thread","turnId":"fake-turn"}}),
+            serde_json::json!({"timestamp":at,"type":"response_item","payload":{"type":"function_call","name":"request_user_input_async","call_id":"async-call","threadId":"fake-thread","turnId":"fake-turn","arguments":"{\"questions\":[{\"title\":\"PRIVATE\"},{\"title\":\"PRIVATE TWO\"}]}"}}),
+            serde_json::json!({"timestamp":at,"type":"response_item","payload":{"type":"function_call_output","call_id":"async-call","output":"{\"accepted\":true}","threadId":"fake-thread","turnId":"fake-turn"}}),
+            serde_json::json!({"timestamp":at,"type":"event_msg","payload":{"type":"task_complete","threadId":"fake-thread","turnId":"fake-turn"}}),
+        ];
+        std::fs::write(
+            &path,
+            lines.iter().map(|v| format!("{v}\n")).collect::<String>(),
+        )
+        .unwrap();
+        service.process_session_path(path.clone()).unwrap();
+        let requests = service.pending_input_requests().unwrap();
+        assert_eq!(requests.len(), 1, "an unanswered asynchronous input request must survive a terminal event in the same file batch");
+        assert_eq!(requests[0].turn_id, "fake-turn");
+        assert_eq!(requests[0].remaining_questions.len(), 2);
+        assert_eq!(
+            service
+                .snapshot()
+                .unwrap()
+                .tasks
+                .iter()
+                .find(|t| t.task_id == "fake-thread")
+                .unwrap()
+                .status,
+            TaskStatus::Succeeded
+        );
+        // Re-reading the same file must neither replay nor duplicate the request.
+        service.process_session_path(path.clone()).unwrap();
+        assert_eq!(service.pending_input_requests().unwrap().len(), 1);
+        let database = root.join("activity.db");
+        let services = crate::runtime::Services {
+            monitor: service.clone(),
+            activity: Arc::new(crate::activity::ActivityService::open(&root, &database).unwrap()),
+            quota: Arc::new(crate::quota::QuotaService::new().unwrap()),
+            news: Arc::new(crate::reset_news::ResetNews::new(store.clone()).unwrap()),
+            passport: Arc::new(crate::passport::CompanionService::new(store.clone()).unwrap()),
+            notices: crate::desktop_notices::DesktopNotices::default(),
+        };
+        assert!(services.sync().unwrap().1.is_empty());
+        assert_eq!(
+            service.pending_input_requests().unwrap().len(),
+            1,
+            "wait for exact ledger identity rather than substitute another round"
+        );
+        let mut record = serde_json::json!({"id":"codex:fake-thread:fake-turn","client":"codex","sessionId":"fake-thread","turnId":"fake-turn","rootId":null,"parentId":null,"isChild":false,"title":"Native task title","projectPath":"/tmp/project","model":null,"provider":null,"turnIndex":1,"status":"succeeded","attention":null,"startedAt":at,"completedAt":at,"observedAt":at,"durationMs":0,"activeMs":null,"waitingMs":null,"tokens":crate::activity::TokenUsage::default(),"live":false,"childCount":0});
+        let db = rusqlite::Connection::open(&database).unwrap();
+        db.execute("INSERT INTO activity_executions VALUES(?1,'codex','fake-thread','fake-turn',?2,?2,?3,'{}')",rusqlite::params![record["id"].as_str(),at,record.to_string()]).unwrap();
+        let (snapshot, fresh) = services.sync().unwrap();
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].kind, "needs_action");
+        assert_eq!(fresh[0].title, "Native task title");
+        assert_eq!(snapshot.executions[0].status, TaskStatus::Succeeded);
+        assert!(service.pending_input_requests().unwrap().is_empty());
+        assert!(services.sync().unwrap().1.is_empty());
+        assert_eq!(store.load_alerts().unwrap().len(), 1);
+        // A distinct child round uses the same path but must stay silent.
+        record["id"] = serde_json::json!("codex:fake-thread:child-turn");
+        record["turnId"] = serde_json::json!("child-turn");
+        record["isChild"] = serde_json::json!(true);
+        db.execute("INSERT INTO activity_executions VALUES(?1,'codex','fake-thread','child-turn',?2,?2,?3,'{}')",rusqlite::params![record["id"].as_str(),at,record.to_string()]).unwrap();
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file,"{}",serde_json::json!({"timestamp":now_rfc3339(),"type":"response_item","payload":{"type":"function_call","name":"request_user_input_async","call_id":"child-question","threadId":"fake-thread","turnId":"child-turn","arguments":"{\"questions\":[{}]}"}})).unwrap();
+        writeln!(file,"{}",serde_json::json!({"timestamp":now_rfc3339(),"type":"response_item","payload":{"type":"function_call_output","call_id":"child-question","output":"{\"accepted\":true}","threadId":"fake-thread","turnId":"child-turn"}})).unwrap();
+        file.flush().unwrap();
+        service.process_session_path(path).unwrap();
+        assert_eq!(service.pending_input_requests().unwrap().len(), 1);
+        assert!(services.sync().unwrap().1.is_empty());
+        assert!(service.pending_input_requests().unwrap().is_empty());
+        assert_eq!(store.load_alerts().unwrap().len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn diagnostic_version_probe_does_not_hold_the_collector_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "monitor-diagnostics-lock-{}-{}.sh",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let marker = path.with_extension("sh.started");
+        let release = path.with_extension("sh.release");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\n: > \"$0.started\"\nwhile [ ! -e \"$0.release\" ]; do sleep 0.01; done\nprintf 'codex-cli fixture\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Arc::new(SnapshotStore::open_in_memory().unwrap());
+        store
+            .save_settings(&Settings {
+                codex_path: Some(path.display().to_string()),
+                ..Settings::default()
+            })
+            .unwrap();
+        let service = MonitorService::new(store).unwrap();
+        let worker_service = service.clone();
+        let worker = thread::spawn(move || worker_service.diagnostics().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !marker.is_file() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let started = marker.is_file();
+        let collector_available = service.inner.try_lock().is_ok();
+        std::fs::write(&release, "").unwrap();
+        let diagnostics = worker.join().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        if started {
+            std::fs::remove_file(marker).unwrap();
+        }
+        std::fs::remove_file(release).unwrap();
+        assert!(started);
+        assert!(
+            collector_available,
+            "a diagnostic subprocess must not block collection and snapshots"
+        );
+        assert_eq!(
+            diagnostics.codex_version.as_deref(),
+            Some("codex-cli fixture")
+        );
+    }
+
+    #[test]
+    fn unlisted_session_activity_does_not_repeat_full_discovery_for_each_tool_event() {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!(
+            "agent-monitor-unlisted-session-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Arc::new(SnapshotStore::open_in_memory().unwrap());
+        store
+            .save_settings(&Settings {
+                codex_path: Some(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/fake-codex.sh")
+                        .display()
+                        .to_string(),
+                ),
+                codex_home: Some(root.display().to_string()),
+                ..Settings::default()
+            })
+            .unwrap();
+        let service = MonitorService::new(store).unwrap();
+        service.sync_now().unwrap();
+        let calls = || {
+            service
+                .inner
+                .lock()
+                .unwrap()
+                .client
+                .as_ref()
+                .unwrap()
+                .request_count()
+        };
+        let path = root.join("rollout.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        let mut append = |kind: &str, turn: &str| {
+            writeln!(file,"{}",serde_json::json!({"timestamp":now_rfc3339(),"type":"event_msg","payload":{"type":kind,"threadId":"unlisted-thread","turnId":turn}})).unwrap();
+            file.flush().unwrap();
+            service.process_session_path(path.clone()).unwrap();
+        };
+        let initial = calls();
+        append("task_started", "live-turn");
+        let discovered = calls();
+        assert!(
+            discovered > initial,
+            "a new session must attempt native discovery"
+        );
+        let deadline = service.inner.lock().unwrap().next_retry_at;
+        for _ in 0..5 {
+            append("item_completed", "live-turn");
+        }
+        assert_eq!(
+            calls(),
+            discovered,
+            "a session omitted by thread/list must not relist all conversations for each item"
+        );
+        assert_eq!(service.inner.lock().unwrap().next_retry_at, deadline);
+        service.sync_now().unwrap();
+        let refreshed = calls();
+        append("item_completed", "live-turn");
+        assert_eq!(
+            calls(),
+            refreshed,
+            "scheduled discovery remains available without restarting the event flood"
+        );
+        drop(append);
+        writeln!(file,"{}",serde_json::json!({"timestamp":now_rfc3339(),"type":"response_item","payload":{"type":"function_call","name":"request_user_input_async","call_id":"unlisted-question","threadId":"unlisted-thread","turnId":"live-turn","arguments":"{\"questions\":[{}]}"}})).unwrap();
+        writeln!(file,"{}",serde_json::json!({"timestamp":now_rfc3339(),"type":"response_item","payload":{"type":"function_call_output","call_id":"unlisted-question","output":"{\"accepted\":true}","threadId":"unlisted-thread","turnId":"live-turn"}})).unwrap();
+        file.flush().unwrap();
+        service.process_session_path(path.clone()).unwrap();
+        assert_eq!(calls(), refreshed);
+        assert_eq!(
+            service.pending_input_requests().unwrap().len(),
+            1,
+            "avoiding redundant discovery must not discard user-input reminders"
+        );
+        let mut append = |kind: &str, turn: &str| {
+            writeln!(file,"{}",serde_json::json!({"timestamp":now_rfc3339(),"type":"event_msg","payload":{"type":kind,"threadId":"unlisted-thread","turnId":turn}})).unwrap();
+            file.flush().unwrap();
+            service.process_session_path(path.clone()).unwrap();
+        };
+        append("task_complete", "live-turn");
+        assert!(calls() > refreshed, "terminal events must still reconcile");
+        let terminal_calls = calls();
+        append("task_started", "next-turn");
+        assert!(
+            calls() > terminal_calls,
+            "the next turn must attempt discovery immediately"
+        );
+        drop(append);
+        drop(file);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn known_session_activity_updates_attention_without_relisting_every_tool_event() {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!(
+            "agent-monitor-no-rpc-flood-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Arc::new(SnapshotStore::open_in_memory().unwrap());
+        store
+            .save_settings(&Settings {
+                codex_path: Some(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/fake-codex.sh")
+                        .display()
+                        .to_string(),
+                ),
+                codex_home: Some(root.display().to_string()),
+                ..Settings::default()
+            })
+            .unwrap();
+        let service = MonitorService::new(store).unwrap();
+        service.sync_now().unwrap();
+        let calls = || {
+            service
+                .inner
+                .lock()
+                .unwrap()
+                .client
+                .as_ref()
+                .unwrap()
+                .request_count()
+        };
+        let baseline_calls = calls();
+        let deadline = service.inner.lock().unwrap().next_retry_at;
+        let path = root.join("rollout.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file,"{}",serde_json::json!({"timestamp":now_rfc3339(),"type":"event_msg","payload":{"type":"task_started","threadId":"fake-thread","turnId":"live-turn"}})).unwrap();
+        writeln!(file,"{}",serde_json::json!({"timestamp":now_rfc3339(),"type":"response_item","payload":{"type":"function_call","name":"request_user_input_async","call_id":"question","threadId":"fake-thread","turnId":"live-turn","arguments":"{\"questions\":[{\"question\":\"PRIVATE\"}]}"}})).unwrap();
+        file.flush().unwrap();
+        service.process_session_path(path.clone()).unwrap();
+        for index in 0..5 {
+            writeln!(file,"{}",serde_json::json!({"timestamp":now_rfc3339(),"type":"response_item","payload":{"type":"function_call_output","call_id":format!("unrelated-{index}"),"threadId":"fake-thread","turnId":"live-turn"}})).unwrap();
+            file.flush().unwrap();
+            service.process_session_path(path.clone()).unwrap();
+        }
+        let snapshot = service.snapshot().unwrap();
+        let task = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id == "fake-thread")
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::NeedsAction);
+        assert_eq!(task.attention, Some(AttentionKind::UserInput));
+        assert_eq!(
+            calls(),
+            baseline_calls,
+            "normal file events must reuse known metadata and must not relist every conversation"
+        );
+        assert_eq!(
+            service.inner.lock().unwrap().next_retry_at,
+            deadline,
+            "file activity must preserve the scheduled metadata reconciliation"
+        );
+        writeln!(file,"{}",serde_json::json!({"timestamp":now_rfc3339(),"type":"event_msg","payload":{"type":"task_complete","threadId":"fake-thread","turnId":"live-turn"}})).unwrap();
+        file.flush().unwrap();
+        service.process_session_path(path).unwrap();
+        assert!(
+            calls() > baseline_calls,
+            "terminal state still requires native API reconciliation"
+        );
+        assert_eq!(
+            service.snapshot().unwrap().tasks[0].status,
+            TaskStatus::Succeeded
+        );
+        drop(file);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejected_async_question_does_not_leave_waiting_or_notify_after_retry_answer() {
+        let service =
+            MonitorService::new(Arc::new(SnapshotStore::open_in_memory().unwrap())).unwrap();
+        let mut inner = service.inner.lock().unwrap();
+        let apply = |inner: &mut MonitorInner, payload: Value| {
+            let mut event = crate::codex::parse_session_event(&serde_json::json!({
+                "timestamp":now_rfc3339(),"type":"response_item","payload":payload
+            }))
+            .unwrap();
+            event.task_id = Some("thread".into());
+            track_input_request(inner, &event);
+            apply_session_event(inner, &event, None);
+        };
+        apply(
+            &mut inner,
+            serde_json::json!({"type":"task_started","turn_id":"turn"}),
+        );
+        for (id, output) in [
+            (
+                "invalid",
+                "failed to parse function arguments: unknown field `question`",
+            ),
+            ("valid", "{\"accepted\":true}"),
+        ] {
+            apply(
+                &mut inner,
+                serde_json::json!({"type":"function_call","name":"request_user_input_async","call_id":id,"arguments":"{\"questions\":[{}]}"}),
+            );
+            apply(
+                &mut inner,
+                serde_json::json!({"type":"function_call_output","call_id":id,"output":output}),
+            );
+        }
+        apply(
+            &mut inner,
+            serde_json::json!({"type":"message","role":"user","content":[{"type":"input_text","text":format!(
+                "<send_user_message_question_reply>{}</send_user_message_question_reply>",
+                serde_json::json!([{"questionItemId":"[\"request_user_input_async\",\"valid\",0]","answer":"done"}])
+            )}]}),
+        );
+        assert_eq!(
+            inner.session_active_turns["thread"].attention, None,
+            "answered retry must not retain rejected question"
+        );
+        assert!(
+            inner.input_requests.is_empty(),
+            "rejected question must never remain queued for notification"
+        );
+    }
+
+    #[test]
+    fn async_user_input_ack_is_not_an_answer_and_all_matching_questions_must_resolve() {
+        let service =
+            MonitorService::new(Arc::new(SnapshotStore::open_in_memory().unwrap())).unwrap();
+        let mut inner = service.inner.lock().unwrap();
+        let apply = |inner: &mut MonitorInner, payload: Value| {
+            let mut event = crate::codex::parse_session_event(&serde_json::json!({
+                "type":"response_item","payload":payload
+            }))
+            .unwrap();
+            event.task_id = Some("fake-thread".into());
+            apply_session_event(inner, &event, None);
+        };
+        let ask = |id: &str, count| {
+            serde_json::json!({
+                "type":"function_call","name":"request_user_input_async","call_id":id,
+                "arguments":serde_json::json!({"questions":(0..count).map(|_|serde_json::json!({"question":"PRIVATE QUESTION"})).collect::<Vec<_>>()} ).to_string()
+            })
+        };
+        let reply = |id: &str, index| {
+            serde_json::json!({
+                "type":"message","role":"user","content":[{"type":"input_text","text":format!(
+                    "<send_user_message_question_reply>{}</send_user_message_question_reply>",
+                    serde_json::json!([{"questionItemId":serde_json::json!(["request_user_input_async",id,index]).to_string(),"answer":"PRIVATE ANSWER"}])
+                )}]
+            })
+        };
+        apply(&mut inner, ask("call-1", 2));
+        assert_eq!(
+            inner.session_active_turns["fake-thread"].attention,
+            Some(AttentionKind::UserInput)
+        );
+        apply(
+            &mut inner,
+            serde_json::json!({"type":"function_call_output","call_id":"call-1","output":"{\"accepted\":true}"}),
+        );
+        assert_eq!(
+            inner.session_active_turns["fake-thread"].attention,
+            Some(AttentionKind::UserInput)
+        );
+        apply(&mut inner, ask("call-2", 1));
+        apply(&mut inner, reply("call-1", 0));
+        apply(&mut inner, reply("call-other", 0));
+        assert_eq!(
+            inner.session_active_turns["fake-thread"].attention,
+            Some(AttentionKind::UserInput)
+        );
+        apply(&mut inner, reply("call-1", 1));
+        assert_eq!(
+            inner.session_active_turns["fake-thread"].attention,
+            Some(AttentionKind::UserInput)
+        );
+        apply(&mut inner, reply("call-2", 0));
+        assert_eq!(inner.session_active_turns["fake-thread"].attention, None);
+    }
+
+    #[test]
+    fn async_question_reply_never_reopens_a_terminal_or_unrelated_turn() {
+        let service =
+            MonitorService::new(Arc::new(SnapshotStore::open_in_memory().unwrap())).unwrap();
+        let mut inner = service.inner.lock().unwrap();
+        let apply = |inner: &mut MonitorInner, payload: Value| {
+            let mut event = crate::codex::parse_session_event(
+                &serde_json::json!({"type":"response_item","payload":payload}),
+            )
+            .unwrap();
+            event.task_id = Some("thread".into());
+            apply_session_event(inner, &event, None)
+        };
+        let reply = serde_json::json!({"type":"message","role":"user","content":[{
+            "type":"input_text","text":format!("<send_user_message_question_reply>{}</send_user_message_question_reply>",
+                serde_json::json!([{"questionItemId":serde_json::json!(["request_user_input_async","question",0]).to_string(),"answer":""}]))
+        }]});
+        assert_eq!(apply(&mut inner, reply.clone()), None);
+        assert!(inner.session_active_turns.is_empty());
+        apply(
+            &mut inner,
+            serde_json::json!({"type":"function_call","name":"request_user_input_async","call_id":"question","turn_id":"turn","arguments":"{\"questions\":[{}]}"}),
+        );
+        apply(
+            &mut inner,
+            serde_json::json!({"type":"task_complete","turn_id":"turn"}),
+        );
+        assert!(inner.session_active_turns.is_empty());
+        assert_eq!(apply(&mut inner, reply), None);
+        assert!(inner.session_active_turns.is_empty());
+    }
+
+    #[test]
+    fn queued_input_matches_session_call_and_question_and_suppresses_answered_requests() {
+        let service =
+            MonitorService::new(Arc::new(SnapshotStore::open_in_memory().unwrap())).unwrap();
+        let mut inner = service.inner.lock().unwrap();
+        let event = |inner: &mut MonitorInner, session: &str, at: &str, payload: Value| {
+            let mut event = crate::codex::parse_session_event(
+                &serde_json::json!({"type":"response_item","timestamp":at,"payload":payload}),
+            )
+            .unwrap();
+            event.task_id = Some(session.into());
+            track_input_request(inner, &event);
+            apply_session_event(inner, &event, None);
+        };
+        let ask = |call: &str| serde_json::json!({"type":"function_call","name":"request_user_input_async","call_id":call,"turn_id":"turn","arguments":"{\"questions\":[{\"title\":\"PRIVATE\"},{\"title\":\"SECRET\"}]}"});
+        let reply = |call: &str, index: usize| serde_json::json!({"type":"message","role":"user","content":[{"type":"input_text","text":format!("<send_user_message_question_reply>{}</send_user_message_question_reply>",serde_json::json!([{"questionItemId":serde_json::json!(["request_user_input_async",call,index]).to_string(),"answer":""}]))}]});
+        event(&mut inner, "chat", "2020-01-01T00:00:00Z", ask("old"));
+        assert!(
+            inner.input_requests.is_empty(),
+            "historical requests must not replay"
+        );
+        let at = now_rfc3339();
+        event(&mut inner, "chat", &at, ask("first"));
+        event(&mut inner, "chat", &at, ask("second"));
+        event(
+            &mut inner,
+            "chat",
+            &at,
+            serde_json::json!({"type":"task_complete","turn_id":"turn"}),
+        );
+        assert!(inner.session_active_turns.is_empty());
+        event(&mut inner, "other-chat", &at, reply("first", 0));
+        event(&mut inner, "chat", &at, reply("first", 9));
+        assert_eq!(inner.input_requests[0].remaining_questions.len(), 2);
+        event(&mut inner, "chat", &at, reply("first", 0));
+        assert_eq!(inner.input_requests[0].remaining_questions.len(), 1);
+        event(&mut inner, "chat", &at, reply("first", 1));
+        assert_eq!(inner.input_requests.len(), 1);
+        assert_eq!(inner.input_requests[0].call_id, "second");
+        assert!(
+            inner.session_active_turns.is_empty(),
+            "an answer for an ended round must not revive it"
+        );
+        event(&mut inner, "chat", &at, reply("second", 0));
+        event(&mut inner, "chat", &at, reply("second", 1));
+        assert!(
+            inner.input_requests.is_empty(),
+            "a question fully answered before publication must not produce a stale input alert"
+        );
+    }
+
+    #[test]
+    fn approval_and_sync_input_require_the_matching_tool_result() {
+        let service =
+            MonitorService::new(Arc::new(SnapshotStore::open_in_memory().unwrap())).unwrap();
+        let mut inner = service.inner.lock().unwrap();
+        let apply = |inner: &mut MonitorInner, payload: Value| {
+            let mut event = crate::codex::parse_session_event(
+                &serde_json::json!({"type":"event_msg","payload":payload}),
+            )
+            .unwrap();
+            event.task_id = Some("thread".into());
+            apply_session_event(inner, &event, None);
+        };
+        apply(
+            &mut inner,
+            serde_json::json!({"type":"exec_approval_request","call_id":"approval"}),
+        );
+        apply(
+            &mut inner,
+            serde_json::json!({"type":"function_call_output","call_id":"other"}),
+        );
+        assert_eq!(
+            inner.session_active_turns["thread"].attention,
+            Some(AttentionKind::Approval)
+        );
+        apply(
+            &mut inner,
+            serde_json::json!({"type":"function_call","name":"request_user_input","call_id":"question"}),
+        );
+        apply(
+            &mut inner,
+            serde_json::json!({"type":"function_call_output","call_id":"question"}),
+        );
+        assert_eq!(
+            inner.session_active_turns["thread"].attention,
+            Some(AttentionKind::Approval)
+        );
+        apply(
+            &mut inner,
+            serde_json::json!({"type":"function_call_output","call_id":"approval"}),
+        );
+        assert_eq!(inner.session_active_turns["thread"].attention, None);
     }
 
     #[test]

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSBluetoothAlwaysUsageDescription</key>
+  <string>连接 AI Passport，显示本机 Agent 任务统计并发送完成提醒。</string>
+  <key>NSBluetoothPeripheralUsageDescription</key>
+  <string>通过蓝牙与 AI Passport 同步任务状态和提醒。</string>
+</dict>
+</plist>

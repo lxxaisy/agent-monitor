@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -114,6 +114,11 @@ pub struct CodexClient {
 }
 
 impl CodexClient {
+    #[cfg(test)]
+    pub(crate) fn request_count(&self) -> u64 {
+        self.next_id.load(Ordering::Relaxed) - 1
+    }
+
     pub fn connect(binary: &Path, codex_home: &Path) -> Result<Self, CodexError> {
         let mut command = app_server_command(binary, codex_home);
         let mut child = command.spawn()?;
@@ -245,6 +250,10 @@ impl CodexClient {
 
     pub fn request(&self, method: &str, params: Value) -> Result<Value, CodexError> {
         self.request_with_timeout(method, params, Duration::from_secs(30))
+    }
+
+    pub fn account_rate_limits(&self) -> Result<Value, CodexError> {
+        self.request_with_timeout("account/rateLimits/read", json!({}), Duration::from_secs(5))
     }
 
     fn request_with_timeout(
@@ -1019,16 +1028,57 @@ pub fn codex_version(binary: &Path) -> Option<String> {
     clear_codex_context_environment(&mut command);
     command.env("CODEX_HOME", &home);
     configure_runtime_environment(&mut command, &home);
-    let output = command.arg("--version").output().ok()?;
-    if !output.status.success() {
-        return None;
+    // An independently spawned app-server can inherit a version probe's pipe.
+    // Capturing to a private regular file avoids waiting for unrelated pipe EOF.
+    static NEXT_PROBE: AtomicU64 = AtomicU64::new(1);
+    let path = std::env::temp_dir().join(format!(
+        "agent-monitor-version-{}-{}.txt",
+        std::process::id(),
+        NEXT_PROBE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines()
-        .next()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
+    let mut output = options.open(&path).ok()?;
+    let result = (|| {
+        let mut child = command
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(output.try_clone().ok()?)
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let status = loop {
+            if let Some(status) = child.try_wait().ok()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        if !status.success() {
+            return None;
+        }
+        output.seek(SeekFrom::Start(0)).ok()?;
+        let mut text = String::new();
+        (&mut output).take(4096).read_to_string(&mut text).ok()?;
+        text.lines()
+            .next()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+    })();
+    drop(output);
+    let _ = std::fs::remove_file(path);
+    result
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1046,6 +1096,38 @@ pub struct SessionEvent {
     pub observed_at: Option<String>,
     pub attention: Option<AttentionKind>,
     pub call_id: Option<String>,
+    pub async_question_count: Option<usize>,
+    pub rejected_input_call: bool,
+    pub accepted_input_call: bool,
+    pub answered_questions: Vec<(String, usize)>,
+}
+
+pub struct SessionActivity {
+    pub session_id: String,
+    pub turn_id: String,
+    pub attention: Option<AttentionKind>,
+}
+
+pub fn rollout_session_ids(path: &Path) -> Option<(String, Option<String>)> {
+    fn uuid(value: &str) -> bool {
+        value.len() == 36
+            && value.chars().enumerate().all(|(index, character)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    character == '-'
+                } else {
+                    character.is_ascii_hexdigit()
+                }
+            })
+    }
+    let stem = path.file_name()?.to_str()?.strip_suffix(".jsonl")?;
+    let mut parts = stem.split('_');
+    let base = parts.next()?;
+    let conversation = base.get(base.len().checked_sub(36)?..)?;
+    if !uuid(conversation) {
+        return None;
+    }
+    let run = parts.next().filter(|value| uuid(value)).map(str::to_owned);
+    Some((conversation.to_owned(), run))
 }
 
 impl JsonlCursor {
@@ -1088,7 +1170,7 @@ pub fn parse_session_event(value: &Value) -> Option<SessionEvent> {
             .and_then(Value::as_str)
     })?;
     let payload = value.get("payload").unwrap_or(value);
-    let kind = payload
+    let mut kind = payload
         .get("type")
         .and_then(Value::as_str)
         .or_else(|| payload.get("event").and_then(Value::as_str))
@@ -1145,8 +1227,31 @@ pub fn parse_session_event(value: &Value) -> Option<SessionEvent> {
                 .and_then(|value| crate::model::timestamp_to_rfc3339(Some(value)))
         });
     let tool_name = payload.get("name").and_then(Value::as_str);
+    let async_question_count =
+        if kind == "function_call" && tool_name == Some("request_user_input_async") {
+            payload
+                .get("arguments")
+                .and_then(Value::as_str)
+                .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())
+                .and_then(|arguments| {
+                    arguments
+                        .get("questions")
+                        .and_then(Value::as_array)
+                        .map(Vec::len)
+                })
+                .filter(|count| *count > 0)
+        } else {
+            None
+        };
+    let answered_questions = answered_async_questions(payload);
+    if !answered_questions.is_empty() {
+        kind = "question_reply".into();
+    }
     let attention = match (kind.as_str(), tool_name) {
         ("function_call", Some("request_user_input")) => Some(AttentionKind::UserInput),
+        ("function_call", Some("request_user_input_async")) if async_question_count.is_some() => {
+            Some(AttentionKind::UserInput)
+        }
         ("exec_approval_request" | "apply_patch_approval_request", _) => {
             Some(AttentionKind::Approval)
         }
@@ -1157,6 +1262,24 @@ pub fn parse_session_event(value: &Value) -> Option<SessionEvent> {
         .or_else(|| payload.get("callId"))
         .and_then(Value::as_str)
         .map(str::to_string);
+    let rejected_input_call = kind == "function_call_output"
+        && payload
+            .get("output")
+            .and_then(Value::as_str)
+            .is_some_and(|output| {
+                output.starts_with("failed to parse function arguments:")
+                    || serde_json::from_str::<Value>(output)
+                        .ok()
+                        .and_then(|value| value.get("accepted").and_then(Value::as_bool))
+                        == Some(false)
+            });
+    let accepted_input_call = kind == "function_call_output"
+        && payload
+            .get("output")
+            .and_then(Value::as_str)
+            .and_then(|output| serde_json::from_str::<Value>(output).ok())
+            .and_then(|value| value.get("accepted").and_then(Value::as_bool))
+            == Some(true);
     Some(SessionEvent {
         task_id,
         turn_id,
@@ -1165,7 +1288,66 @@ pub fn parse_session_event(value: &Value) -> Option<SessionEvent> {
         observed_at,
         attention,
         call_id,
+        async_question_count,
+        rejected_input_call,
+        accepted_input_call,
+        answered_questions,
     })
+}
+
+fn answered_async_questions(payload: &Value) -> Vec<(String, usize)> {
+    if payload.get("type").and_then(Value::as_str) != Some("message")
+        || payload.get("role").and_then(Value::as_str) != Some("user")
+    {
+        return Vec::new();
+    }
+    let mut answered = Vec::new();
+    for block in payload
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if block.get("type").and_then(Value::as_str) != Some("input_text") {
+            continue;
+        }
+        let Some(text) = block.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(json) = text
+            .trim()
+            .strip_prefix("<send_user_message_question_reply>")
+            .and_then(|text| text.strip_suffix("</send_user_message_question_reply>"))
+        else {
+            continue;
+        };
+        let Ok(replies) = serde_json::from_str::<Vec<Value>>(json) else {
+            continue;
+        };
+        for reply in replies {
+            if reply.get("answer").and_then(Value::as_str).is_none() {
+                continue;
+            }
+            let Some(identity) = reply.get("questionItemId").and_then(Value::as_str) else {
+                continue;
+            };
+            let Ok(parts) = serde_json::from_str::<Vec<Value>>(identity) else {
+                continue;
+            };
+            if parts.len() != 3 || parts[0].as_str() != Some("request_user_input_async") {
+                continue;
+            }
+            if let (Some(call), Some(index)) = (
+                parts[1].as_str(),
+                parts[2]
+                    .as_u64()
+                    .and_then(|index| usize::try_from(index).ok()),
+            ) {
+                answered.push((call.into(), index));
+            }
+        }
+    }
+    answered
 }
 
 #[cfg(test)]
@@ -1255,6 +1437,33 @@ mod tests {
         assert_eq!(event.turn_id, None);
         assert_eq!(event.call_id.as_deref(), Some("call-1"));
         assert!(event.plan.is_none());
+    }
+
+    #[test]
+    fn async_input_and_question_replies_retain_only_control_metadata() {
+        let event = parse_session_event(&serde_json::json!({
+            "type":"response_item","payload":{"type":"function_call",
+                "name":"request_user_input_async","call_id":"call-async",
+                "arguments":"{\"questions\":[{\"question\":\"PRIVATE QUESTION\"},{\"question\":\"PRIVATE OTHER\"}]}"}
+        })).unwrap();
+        assert_eq!(event.attention, Some(AttentionKind::UserInput));
+        assert_eq!(event.async_question_count, Some(2));
+        assert!(!format!("{event:?}").contains("PRIVATE"));
+        let response = parse_session_event(&serde_json::json!({
+            "type":"response_item","payload":{"type":"message","role":"user","content":[{
+                "type":"input_text","text":"<send_user_message_question_reply>[{\"questionItemId\":\"[\\\"request_user_input_async\\\",\\\"call-async\\\",0]\",\"answer\":\"PRIVATE ANSWER\"}]</send_user_message_question_reply>"
+            }]}
+        })).unwrap();
+        assert_eq!(response.kind, "question_reply");
+        assert_eq!(response.answered_questions, vec![("call-async".into(), 0)]);
+        assert!(!format!("{response:?}").contains("PRIVATE"));
+        let ordinary = parse_session_event(&serde_json::json!({
+            "type":"response_item","payload":{"type":"message","role":"user","content":[{
+                "type":"input_text","text":"ordinary user input"
+            }]}
+        }))
+        .unwrap();
+        assert!(ordinary.answered_questions.is_empty());
     }
 
     #[test]
@@ -1486,6 +1695,53 @@ mod tests {
                 native
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_does_not_wait_for_descendants_to_close_stdout() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "monitor-version-descendant-{}-{}.sh",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nsleep 6 &\nprintf 'codex-cli fixture\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let began = Instant::now();
+        let version = codex_version(&path);
+        let elapsed = began.elapsed();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(version.as_deref(), Some("codex-cli fixture"));
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "version query waited {elapsed:?} for an unrelated inherited pipe"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_stops_a_hung_command() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "monitor-version-timeout-{}-{}.sh",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::write(&path, "#!/bin/sh\nexec sleep 5\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let began = Instant::now();
+        assert_eq!(codex_version(&path), None);
+        let elapsed = began.elapsed();
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "version query was not bounded: {elapsed:?}"
+        );
     }
 
     #[cfg(unix)]

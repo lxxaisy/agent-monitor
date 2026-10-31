@@ -25,6 +25,17 @@ notify = "6.1"
 dirs = "5.0"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 thiserror = "1.0"
+serialport = { version = "4.8", default-features = false }
+btleplug = "0.11"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
+futures = "0.3"
+uuid = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+aes-gcm = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+tiny_http = "0.12"
+zstd = "0.13"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 notify-rust = "4.18.0"

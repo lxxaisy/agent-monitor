@@ -1,5 +1,7 @@
 use crate::model::{Settings, TaskSnapshot};
+use crate::passport::{AlertRecord, PassportConnection, PassportSettings};
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -84,6 +86,27 @@ impl SnapshotStore {
              CREATE TABLE IF NOT EXISTS notifications (
                notification_key TEXT PRIMARY KEY,
                created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS passport_settings (
+               id INTEGER PRIMARY KEY CHECK (id = 1),
+               payload TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS passport_connection (
+               id INTEGER PRIMARY KEY CHECK (id = 1),
+               payload TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS reset_monitor (
+               id INTEGER PRIMARY KEY CHECK (id = 1),
+               payload TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS activity_alerts (
+               id TEXT PRIMARY KEY,
+               payload TEXT NOT NULL,
+               created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS activity_observed_states (
+               id TEXT PRIMARY KEY,
+               status TEXT NOT NULL
              );",
         )?;
         Ok(())
@@ -185,6 +208,185 @@ impl SnapshotStore {
         connection.execute_batch("DELETE FROM tasks; DELETE FROM notifications;")?;
         Ok(())
     }
+
+    pub fn load_passport_settings(&self) -> Result<PassportSettings, StorageError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let payload: Option<String> = connection
+            .query_row(
+                "SELECT payload FROM passport_settings WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match payload {
+            Some(payload) => Ok(serde_json::from_str(&payload)?),
+            None => Ok(PassportSettings::default()),
+        }
+    }
+
+    pub fn save_passport_settings(&self, settings: &PassportSettings) -> Result<(), StorageError> {
+        let payload = serde_json::to_string(settings)?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        connection.execute("INSERT INTO passport_settings(id,payload) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",[payload])?;
+        Ok(())
+    }
+
+    pub fn load_passport_connection(&self) -> Result<Option<PassportConnection>, StorageError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let payload: Option<String> = connection
+            .query_row(
+                "SELECT payload FROM passport_connection WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        payload
+            .map(|value| serde_json::from_str(&value).map_err(StorageError::from))
+            .transpose()
+    }
+
+    pub fn save_passport_connection(
+        &self,
+        target: Option<&PassportConnection>,
+    ) -> Result<(), StorageError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        if let Some(target) = target {
+            connection.execute(
+                "INSERT INTO passport_connection(id,payload) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
+                [serde_json::to_string(target)?],
+            )?;
+        } else {
+            connection.execute("DELETE FROM passport_connection WHERE id=1", [])?;
+        }
+        Ok(())
+    }
+
+    pub fn insert_alert_once(&self, alert: &AlertRecord) -> Result<bool, StorageError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let inserted = connection.execute(
+            "INSERT OR IGNORE INTO activity_alerts(id,payload,created_at) VALUES(?1,?2,?3)",
+            params![alert.id, serde_json::to_string(alert)?, alert.created_at],
+        )?;
+        Ok(inserted == 1)
+    }
+
+    pub fn load_alerts(&self) -> Result<Vec<AlertRecord>, StorageError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let mut statement = connection
+            .prepare("SELECT payload FROM activity_alerts ORDER BY created_at DESC,id DESC")?;
+        let records = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut alerts = Vec::new();
+        for record in records {
+            alerts.push(serde_json::from_str(&record?)?);
+        }
+        Ok(alerts)
+    }
+
+    pub fn load_reset_monitor(&self) -> Result<Option<serde_json::Value>, StorageError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let payload: Option<String> = connection
+            .query_row("SELECT payload FROM reset_monitor WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        payload
+            .map(|text| serde_json::from_str(&text).map_err(StorageError::from))
+            .transpose()
+    }
+
+    pub fn save_reset_monitor(&self, value: &serde_json::Value) -> Result<(), StorageError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        connection.execute("INSERT INTO reset_monitor(id,payload) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload", [serde_json::to_string(value)?])?;
+        Ok(())
+    }
+
+    pub fn acknowledge_alert(&self, id: &str) -> Result<(), StorageError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let payload: String = connection.query_row(
+            "SELECT payload FROM activity_alerts WHERE id=?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        let mut alert: AlertRecord = serde_json::from_str(&payload)?;
+        alert.unread = false;
+        connection.execute(
+            "UPDATE activity_alerts SET payload=?2 WHERE id=?1",
+            params![id, serde_json::to_string(&alert)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn prune_expired(&self, cutoff: &str) -> Result<usize, StorageError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let transaction = connection.transaction()?;
+        let alerts = transaction.execute(
+            "DELETE FROM activity_alerts
+             WHERE created_at < ?1
+               AND json_extract(payload,'$.unread') IS NOT 1",
+            [cutoff],
+        )?;
+        let notifications =
+            transaction.execute("DELETE FROM notifications WHERE created_at < ?1", [cutoff])?;
+        transaction.commit()?;
+        Ok(alerts + notifications)
+    }
+
+    pub fn replace_execution_states(
+        &self,
+        states: &[(String, String)],
+    ) -> Result<HashMap<String, String>, StorageError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let transaction = connection.transaction()?;
+        let mut previous = HashMap::new();
+        for (id, status) in states {
+            let old: Option<String> = transaction
+                .query_row(
+                    "SELECT status FROM activity_observed_states WHERE id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(old) = old {
+                previous.insert(id.clone(), old);
+            }
+            transaction.execute("INSERT INTO activity_observed_states(id,status) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET status=excluded.status",params![id,status])?;
+        }
+        transaction.commit()?;
+        Ok(previous)
+    }
 }
 
 #[cfg(test)]
@@ -235,5 +437,68 @@ mod tests {
         assert_eq!(store.load_settings().unwrap(), settings);
         store.clear().unwrap();
         assert!(store.load_tasks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn persists_unread_and_dedup_across_execution_observations() {
+        let store = SnapshotStore::open_in_memory().unwrap();
+        let alert = AlertRecord {
+            id: "codex:s:t:completed".into(),
+            task_id: "codex:s:t".into(),
+            kind: "completed".into(),
+            title: "Task".into(),
+            created_at: "2026-10-21T12:00:00Z".into(),
+            unread: true,
+        };
+        assert!(store.insert_alert_once(&alert).unwrap());
+        assert!(!store.insert_alert_once(&alert).unwrap());
+        assert!(store.load_alerts().unwrap()[0].unread);
+        store.acknowledge_alert(&alert.id).unwrap();
+        assert!(!store.load_alerts().unwrap()[0].unread);
+        let first = vec![("t".into(), "running".into())];
+        assert!(store.replace_execution_states(&first).unwrap().is_empty());
+        assert_eq!(
+            store
+                .replace_execution_states(&[("t".into(), "succeeded".into())])
+                .unwrap()
+                .get("t")
+                .map(String::as_str),
+            Some("running")
+        );
+        let settings = PassportSettings {
+            muted: true,
+            quiet_start: 0,
+            quiet_end: 0,
+        };
+        store.save_passport_settings(&settings).unwrap();
+        assert_eq!(store.load_passport_settings().unwrap(), settings);
+    }
+
+    #[test]
+    fn prunes_old_read_alerts_and_notification_keys_but_keeps_unread_alerts() {
+        let store = SnapshotStore::open_in_memory().unwrap();
+        let read = AlertRecord {
+            id: "old-read".into(),
+            task_id: "task".into(),
+            kind: "completed".into(),
+            title: "Finished".into(),
+            created_at: "2020-01-01T00:00:00Z".into(),
+            unread: false,
+        };
+        let unread = AlertRecord {
+            id: "old-unread".into(),
+            unread: true,
+            ..read.clone()
+        };
+        store.insert_alert_once(&read).unwrap();
+        store.insert_alert_once(&unread).unwrap();
+        store
+            .mark_notification_once("old-key", "2020-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(store.prune_expired("2021-01-01T00:00:00Z").unwrap(), 2);
+        let alerts = store.load_alerts().unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].id, "old-unread");
+        assert!(store.mark_notification_once("old-key", "later").unwrap());
     }
 }
